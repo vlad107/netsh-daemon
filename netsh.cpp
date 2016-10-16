@@ -21,17 +21,21 @@
 #define MAX_EVENTS 100
 #define BUFF_SIZE 2048
 
+void debug(int socket, std::string name) {
+	std::cerr << name << ": " << socket << std::endl;
+}
+
 bool isquot(char c) {
 	return ((c == '\'') || (c == '\"'));
 }
 
-std::set<int> first_fds;
+std::set<int> write_fds;
 std::map<int, int> last_fds;
 std::vector<std::pair<int, int>> pipes;
 int port, sfd, efd;
 std::set<int> client_sockets;
 std::map<int, int> who_writes;
-std::map<int, int> out_fd;
+std::map<int, int> wait_child;
 
 struct my_data {
 	my_data(int type) : type(type) {}
@@ -42,7 +46,7 @@ private:
 	int type;
 };
 
-void epoll_add(int efd, int fd, int mask, my_data data); 
+void epoll_add(int efd, int fd, int mask); 
 void epoll_remove(int efd, int fd, int mask);
 
 void error(std::string s) {
@@ -71,19 +75,18 @@ struct Buffer {
 				}
 			}
 		}
-		if (execed()) flush(); 
 	}
-	std::string until_endl() {
+
+	std::string get_command() {
 		cur = id_endl + 1;
 		return s.substr(0, id_endl);
 	}
+
 	void write_chunk() {
 		if (cur == (int)s.size()) return;
 		char buff[BUFF_SIZE];
 		int len = std::min((int)s.size() - cur, BUFF_SIZE);	
-		for (int i = 0; i < len; i++) {
-			buff[i] = s[i + cur];
-		}
+		for (int i = 0; i < len; i++) buff[i] = s[i + cur];
 		buff[len] = 0;
 		int nw;
 		while (1) {
@@ -91,40 +94,35 @@ struct Buffer {
 			if ((nw < 0) && (errno == EINTR)) continue;
 			break;
 		}
-		if (nw < 0) {
-			error("Error in write()");
-		}
+		if (nw < 0) error("Error in write():\n" + std::string(strerror(errno)));
 		cur += nw;
-		if (cur == nw) {
-			auto it = first_fds.find(write_fd);
-			if (it != first_fds.end()) {
-				first_fds.erase(it);
+		if (cur == (int)s.size()) {
+			auto it = write_fds.find(write_fd);
+			if (it != write_fds.end()) {
+				write_fds.erase(it);
 				epoll_remove(efd, write_fd, EPOLLOUT);
 			}
 		}
 	}
+
 	void flush() {
 		write_chunk();
 		return;
+
+
 		if (cur == (int)s.size()) return;
-		if (first_fds.find(write_fd) == first_fds.end()) {
-			first_fds.insert(write_fd);
+		if (write_fds.find(write_fd) == write_fds.end()) {
+			write_fds.insert(write_fd);
 			std::cerr << "in flush fd = " << write_fd << std::endl;
-			epoll_add(efd, write_fd, EPOLLOUT, );
+			epoll_add(efd, write_fd, EPOLLOUT);
 		}
-	}
-	void set_client_fd(int fd) {
-		client_fd = fd;
 	}
 	void set_write_fd(int fd) {
 		write_fd = fd;
 		who_writes[fd] = client_fd;
 	}
-	void make_execed() { 
-		_execed = true; 
-		write_chunk();
-		//flush();
-	}
+	void make_execed() { _execed = true; }
+	void set_client_fd(int fd) { client_fd = fd; }
 	bool execed() { return _execed; }
 	bool was_endl() { return id_endl != -1; }
 private:
@@ -176,8 +174,7 @@ std::string read_all(int fd) {
 	}
 	if (nr < 0) {
 		if (errno != EAGAIN) {
-			error("Error in read_all()");
-			//error(strerror(errno));
+			error("Error in read_all():\n" + std::string(strerror(errno)));
 		}
 	}
 		
@@ -210,11 +207,10 @@ int create_epoll() {
 	return efd;
 }
 
-void epoll_add(int efd, int fd, int mask, my_data tp) {
+void epoll_add(int efd, int fd, int mask) {
 	epoll_event ev;
 	memset(&ev, 0, sizeof(epoll_event));
 	ev.data.fd = fd;
-	ev.data.ptr = new my_data(tp);
 	ev.events = mask;
 	std::cerr << "epoll_add: fd = " << fd << std::endl;
 	if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev) < 0) {
@@ -245,9 +241,33 @@ void accept_handler(int sfd) {
 		if ((cfd < 0) && (errno == EINTR)) continue;
 		break;
 	}
+	if (cfd < 0) error("Error in accept():\n" + std::string(strerror(errno)));
+	debug(cfd, "New client to socket");
 	make_nonblocking(cfd);
 	epoll_add(efd, cfd, EPOLLIN);
 	client_sockets.insert(cfd);
+}
+
+int exec_command(std::string command, int curstdin, int curstdout) {
+	int pid = fork();
+	if (pid < 0) error("Error in fork():\n" + std::string(strerror(errno)));
+	if (pid == 0) {
+		close(STDIN_FILENO); dup(curstdin);
+		close(STDOUT_FILENO); dup(curstdout);
+		close(curstdin);
+		close(curstdout);
+		std::vector<std::string> args = split(command, ' ');
+		char **argv = new char*[args.size() + 1];
+		for (int i = 0; i < (int)args.size(); i++) {
+			argv[i] = new char[args[i].size() + 1];
+			strcpy(argv[i], args[i].c_str());
+			argv[i][(int)args[i].size()] = 0;
+		}
+		argv[(int)args.size()] = 0;
+		execvp(argv[0], argv);
+		exit(0);
+	}
+	return pid;
 }
 
 void client_handler(int cfd) {
@@ -255,104 +275,71 @@ void client_handler(int cfd) {
 	Buffer &buff = cl_buff[cfd];
 	buff.set_client_fd(cfd);
 	buff.add_data(s);
-	if (!buff.execed() && buff.was_endl()) { 
-		std::string command = buff.until_endl();
-		std::vector<std::string> commands = split(command, '|');
-		std::vector<std::pair<int, int>> pipes(commands.size() + 1);
-		for (int i = 0; i + 1 < (int)pipes.size(); i++) {
-			int p[2];
-			if (pipe2(p, O_CLOEXEC) < 0) error("Error in pipe2()");
-			make_nonblocking(p[0]);
-			make_nonblocking(p[1]);
-			pipes[i] = std::make_pair(p[0], p[1]);
-		}
-		first_fd[cfd] = pipes[0].second;
-		buff.set_write_fd(pipes[0].second);
-		pipes.back().second = dup(cfd);
-		make_nonblocking(pipes.back().second);
-		out_fd[cfd] = pipes.back().second;
-		for (int i = 0; i < (int)commands.size(); i++) {
-			std::string cmd = commands[i];
-			int cpid;
-			if ((cpid = fork()) < 0) error("Error in fork()");
-			if (cpid == 0) {
-				close(STDIN_FILENO);
-				dup(pipes[i].first);
-				close(STDOUT_FILENO);
-				dup(pipes[i + 1].second);
-				close(pipes[i].first);
-				close(pipes[i + 1].second);
-				std::vector<std::string> args = split(cmd, ' ');
-				for (int i = 0; i < (int)args.size(); i++) {
-					if ((isquot(args[i][0])) && (args[i][0] == args[i][(int)args[i].size() - 1])) {
-						args[i] = args[i].substr(1, (int)args[i].size() - 2);
-					}
-				}
-				std::string name = args[0];
-				char **argv = new char*[(int)args.size() + 1];
-				for (int j = 0; j < (int)args.size(); j++) {
-					argv[j] = new char[(int)args[j].size() + 1];
-					strcpy(argv[j], args[j].c_str());
-					argv[j][(int)args[j].size()] = 0;
-				}
-				argv[(int)args.size()] = 0;
-				if (execvp(name.c_str(), argv) < 0) error("Error in execvp()");
-				exit(0);
-			} else {
-				if (i + 1 == (int)commands.size()) {
-					last_fds[cpid] = cfd;
-				}
-			}
-		}
-		for (int i = 0; i + 1 < (int)commands.size(); i++) {
-			close(pipes[i].first);
-			close(pipes[i].second);
-		}
+	if (buff.execed()) {
+		buff.flush();
+	} else if (buff.was_endl()) {
 		buff.make_execed();
-	} 
+		std::string command = buff.get_command();		
+		std::vector<std::string> commands = split(command, '|');
+		int p[2];
+		pipe2(p, O_CLOEXEC);
+		buff.set_write_fd(p[1]);
+		int curstdin = p[0];
+		for (int i = 0; i < (int)commands.size(); i++) {
+			int nextstdin, curstdout;
+			if (i + 1 < (int)commands.size()) {
+				pipe2(p, O_CLOEXEC);
+				nextstdin = p[0];
+				curstdout = p[1];
+			} else {
+				nextstdin = -1;
+				curstdout = cfd;
+			}
+			int chpid = exec_command(commands[i], curstdin, curstdout);
+			close(curstdin);
+			if (i + 1 < (int)commands.size()) {
+				close(curstdout);
+			} else wait_child[chpid] = cfd;
+			curstdin = nextstdin;
+		}
+		buff.flush();
+	}
 }
 
-void sighandler(int signum, siginfo_t *info, void*) {
+void chld_handler(int signum, siginfo_t *info, void*) {
 	assert(signum == SIGCHLD);
 	int pid = info->si_pid;
 	waitpid(pid, NULL, 0);
-	if (last_fds.count(pid) > 0) {
-		int cfd = last_fds[pid];
+	if (wait_child.count(pid) > 0) {
+		int cfd = wait_child[pid];
 		epoll_remove(efd, cfd, EPOLLIN);
-		last_fds.erase(pid);
-		//std::cerr << "close " << first_fd[cfd] << std::endl;
-		//std::cerr << "close " << cfd << std::endl;
-		close(first_fd[cfd]);
-		close(out_fd[cfd]);
 		close(cfd);
-		client_sockets.erase(cfd);
-		first_fd.erase(cfd);
+		wait_child.erase(pid);
 	}
-	//std::cerr << "finished " << pid << std::endl;
 }
 
 void make_sigact() {
 	struct sigaction sa;
 	sa.sa_flags = SA_SIGINFO;
 	sigemptyset(&sa.sa_mask);
-	sa.sa_sigaction = sighandler;
+	sa.sa_sigaction = chld_handler;
 	if (sigaction(SIGCHLD, &sa, NULL) < 0) error("Error in sigaction()");
 }
 
 int main(int argc, char *argv[]) {
-	//if ((argc != 2) || (sscanf(argv[1], "%d\n", &port) < 0)) error("Usage: " + std::string(argv[0]) + " [port]");
-	port = 1237;
+	if ((argc != 2) || (sscanf(argv[1], "%d\n", &port) < 0)) error("Usage: " + std::string(argv[0]) + " [port]");
 	make_sigact();
 	sfd = create_socket(port);
+	debug(sfd, "main socket");
 	make_nonblocking(sfd);
 	efd = create_epoll();
-	epoll_add(efd, sfd, EPOLLIN, EPOLLFD_TYPE);
+	debug(efd, "epoll socket");
+	epoll_add(efd, sfd, EPOLLIN);
 	struct epoll_event evs[MAX_EVENTS];
 	while (true) {
 		int ev_size;
 		if ((ev_size = epoll_wait(efd, evs, MAX_EVENTS, -1)) < 0) {
-			error(strerror(errno));
-			error("Error in epoll_wait()");
+			error("Error in epoll_wait:\n" + std::string(strerror(errno)));
 		}
 		for (int i = 0; i < ev_size; i++) {
 			int fd = evs[i].data.fd;
@@ -360,7 +347,7 @@ int main(int argc, char *argv[]) {
 				accept_handler(sfd);
 			} else if (client_sockets.find(fd) != client_sockets.end()) {
 				client_handler(fd);
-			} else if (first_fds.find(fd) != first_fds.end()) {
+			} else if (write_fds.find(fd) != write_fds.end()) {
 				int cfd = who_writes[fd];
 				Buffer &buff = cl_buff[cfd];
 				buff.write_chunk();
