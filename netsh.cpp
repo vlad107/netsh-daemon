@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <assert.h>
 
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -326,8 +327,30 @@ void make_sigact() {
 	if (sigaction(SIGCHLD, &sa, NULL) < 0) error("Error in sigaction()");
 }
 
+void become_daemon() {
+	int pid = fork();
+	if (pid < 0) error("Error in fork():\n" + std::string(strerror(errno)));
+	if (pid != 0) exit(0);
+	setsid();
+	pid = fork();
+	if (pid < 0) error("Error in fork():\n" + std::string(strerror(errno)));
+	if (pid != 0) exit(0);
+	pid = getpid();
+	chdir("/");
+	umask(0);
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+	int fd = open("/tmp/netsh.pid", O_WRONLY | O_CREAT);
+	if (fd < 0) error("Error in open():\n" + std::string(strerror(errno)));
+	pid = getpid();
+	dprintf(fd, "%d\n", pid);
+	close(fd);
+}
+
 int main(int argc, char *argv[]) {
 	if ((argc != 2) || (sscanf(argv[1], "%d\n", &port) < 0)) error("Usage: " + std::string(argv[0]) + " [port]");
+	become_daemon();
 	make_sigact();
 	sfd = create_socket(port);
 	debug(sfd, "main socket");
