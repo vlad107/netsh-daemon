@@ -36,15 +36,6 @@ std::set<int> client_sockets;
 std::map<int, int> who_writes;
 std::map<int, int> wait_child;
 
-struct my_data {
-	my_data(int type) : type(type) {}
-	int get_type() {
-		return type;
-	}
-private:
-	int type;
-};
-
 void epoll_add(int efd, int fd, int mask); 
 void epoll_remove(int efd, int fd, int mask);
 
