@@ -30,8 +30,6 @@ bool isquot(char c) {
 }
 
 std::set<int> write_fds;
-std::map<int, int> last_fds;
-std::vector<std::pair<int, int>> pipes;
 int port, sfd, efd;
 std::set<int> client_sockets;
 std::map<int, int> who_writes;
@@ -84,10 +82,12 @@ struct Buffer {
 
 	void write_chunk() {
 		if (cur == (int)s.size()) return;
+//		std::cerr << "cur = " << cur << " / " << s.size() << std::endl;
 		char buff[BUFF_SIZE];
 		int len = std::min((int)s.size() - cur, BUFF_SIZE);	
 		for (int i = 0; i < len; i++) buff[i] = s[i + cur];
 		buff[len] = 0;
+//		fprintf(stderr, "Submit %s for %s\n", buff, s.c_str());
 		int nw;
 		while (1) {
 			nw = ::write(write_fd, buff, len);		
@@ -106,15 +106,11 @@ struct Buffer {
 	}
 
 	void flush() {
-		write_chunk();
-		return;
-
-
 		if (cur == (int)s.size()) return;
 		if (write_fds.find(write_fd) == write_fds.end()) {
 			write_fds.insert(write_fd);
-			std::cerr << "in flush fd = " << write_fd << std::endl;
 			epoll_add(efd, write_fd, EPOLLOUT);
+//			std::cerr << "Socket for writing: " << write_fd << std::endl;
 		}
 	}
 	void set_write_fd(int fd) {
@@ -135,7 +131,6 @@ private:
 	int client_fd;
 };
 
-std::map<int, int> first_fd;
 std::map<int, Buffer> cl_buff;
 
 std::vector<std::string> split(std::string s, char sep) {
@@ -170,11 +165,12 @@ std::string read_all(int fd) {
 			if (errno == EINTR) continue;
 			break;
 		}	
+		buff[nr] = 0;
 		result += std::string(buff);
 	}
 	if (nr < 0) {
 		if (errno != EAGAIN) {
-			error("Error in read_all():\n" + std::string(strerror(errno)));
+			error("Error in read_all(): " + std::to_string(fd) + "\n" + std::string(strerror(errno)));
 		}
 	}
 		
@@ -214,7 +210,6 @@ void epoll_add(int efd, int fd, int mask) {
 	ev.events = mask;
 	std::cerr << "epoll_add: fd = " << fd << std::endl;
 	if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-//		error(strerror(errno));
 		error("Error in epoll_ctl() (EPOLL_CTL_ADD)");
 	}	
 }
@@ -226,10 +221,8 @@ void epoll_remove(int efd, int fd, int mask) {
 	ev.events = mask;
 	std::cerr << "epoll_remove: fd = " << fd << std::endl;
 	if (epoll_ctl(efd, EPOLL_CTL_DEL, fd, &ev) < 0) {
-//		error(strerror(errno));
 		error("Error in epoll_ctl() (EPOLL_CTL_DEL)");
 	}
-	close(fd);
 }
 
 void accept_handler(int sfd) {
@@ -248,7 +241,7 @@ void accept_handler(int sfd) {
 	client_sockets.insert(cfd);
 }
 
-int exec_command(std::string command, int curstdin, int curstdout) {
+int exec_command(std::string command, int curstdin, int curstdout, int cfd) {
 	int pid = fork();
 	if (pid < 0) error("Error in fork():\n" + std::string(strerror(errno)));
 	if (pid == 0) {
@@ -256,9 +249,13 @@ int exec_command(std::string command, int curstdin, int curstdout) {
 		close(STDOUT_FILENO); dup(curstdout);
 		close(curstdin);
 		close(curstdout);
+		close(cfd);
 		std::vector<std::string> args = split(command, ' ');
 		char **argv = new char*[args.size() + 1];
 		for (int i = 0; i < (int)args.size(); i++) {
+			if (isquot(args[i][0]) && (args[i][0] == args[i][(int)args[i].size() - 1])) {
+				args[i] = args[i].substr(1, (int)args[i].size() - 2);
+			}
 			argv[i] = new char[args[i].size() + 1];
 			strcpy(argv[i], args[i].c_str());
 			argv[i][(int)args[i].size()] = 0;
@@ -276,6 +273,7 @@ void client_handler(int cfd) {
 	buff.set_client_fd(cfd);
 	buff.add_data(s);
 	if (buff.execed()) {
+		//std::cerr << "flush socket:" << cfd << std::endl;
 		buff.flush();
 	} else if (buff.was_endl()) {
 		buff.make_execed();
@@ -295,7 +293,7 @@ void client_handler(int cfd) {
 				nextstdin = -1;
 				curstdout = cfd;
 			}
-			int chpid = exec_command(commands[i], curstdin, curstdout);
+			int chpid = exec_command(commands[i], curstdin, curstdout, cfd);
 			close(curstdin);
 			if (i + 1 < (int)commands.size()) {
 				close(curstdout);
@@ -314,7 +312,9 @@ void chld_handler(int signum, siginfo_t *info, void*) {
 		int cfd = wait_child[pid];
 		epoll_remove(efd, cfd, EPOLLIN);
 		close(cfd);
+		client_sockets.erase(cfd);
 		wait_child.erase(pid);
+		cl_buff.erase(cfd);
 	}
 }
 
