@@ -18,9 +18,11 @@
 #include <map>
 #include <vector>
 
+#define deb(x) std::cerr << x << std::endl
 #define LISTEN_BACKLOG 10
 #define MAX_EVENTS 100
-#define BUFF_SIZE 2048
+#define BUFF_SIZE 1024 * 10
+#define BIG_BUFF_SIZE 1024 * 100 
 
 void debug(int socket, std::string name) {
 	std::cerr << name << ": " << socket << std::endl;
@@ -45,7 +47,7 @@ void error(std::string s) {
 }
 
 struct Buffer {
-	Buffer() : s(""), cur(0), lq(0), _execed(false), id_endl(-1), write_fd(-1), client_fd(-1) {}
+	Buffer() : s(""), lq(0), _execed(false), id_endl(-1), write_fd(-1), client_fd(-1), write_fd_closed(false), cfd(-1),_removed(false) {}
 	void add_data(std::string ns) {
 		if (ns == "") return;
 		int prev_len = (int)s.size();
@@ -65,40 +67,53 @@ struct Buffer {
 				}
 			}
 		}
+		if (s.size() > BIG_BUFF_SIZE) {
+			deb("1");
+			remove_from_epoll();
+		}
 	}
 
 	std::string get_command() {
-		cur = id_endl + 1;
-		return s.substr(0, id_endl);
+		std::string result = s.substr(0, id_endl);
+		s = s.substr(id_endl);
+		return result;
 	}
 
 	void write_chunk() {
-		if (cur == (int)s.size()) return;
+		bool in_epoll = (int)s.size() <= BIG_BUFF_SIZE;
+		if (s.empty()) return;
 //		std::cerr << "cur = " << cur << " / " << s.size() << std::endl;
 		char buff[BUFF_SIZE];
-		int len = std::min((int)s.size() - cur, BUFF_SIZE);	
-		for (int i = 0; i < len; i++) buff[i] = s[i + cur];
+		int len = std::min((int)s.size(), BUFF_SIZE);	
+		for (int i = 0; i < len; i++) buff[i] = s[i];
 		buff[len] = 0;
 //		fprintf(stderr, "Submit %s for %s\n", buff, s.c_str());
 		int nw;
 		while (1) {
 			nw = ::write(write_fd, buff, len);		
+			std::cerr << "written " << nw << " chars to " << write_fd << " descriptor" << std::endl;
 			if ((nw < 0) && (errno == EINTR)) continue;
 			break;
 		}
 		if (nw < 0) error("Error in write():\n" + std::string(strerror(errno)));
-		cur += nw;
-		if (cur == (int)s.size()) {
+		s = s.substr(nw);
+		if (s.empty()) {
 			auto it = write_fds.find(write_fd);
 			if (it != write_fds.end()) {
 				write_fds.erase(it);
+				deb("3");
 				epoll_remove(efd, write_fd, EPOLLOUT);
 			}
+			if (write_fd_closed) close(write_fd);
+		}
+		if ((s.size() <= BIG_BUFF_SIZE) && (!in_epoll)) {
+			epoll_add(efd, cfd, EPOLLIN);
+			_removed = false;
 		}
 	}
 
 	void flush() {
-		if (cur == (int)s.size()) return;
+		if (s.empty()) return;
 		if (write_fds.find(write_fd) == write_fds.end()) {
 			write_fds.insert(write_fd);
 			epoll_add(efd, write_fd, EPOLLOUT);
@@ -113,14 +128,29 @@ struct Buffer {
 	void set_client_fd(int fd) { client_fd = fd; }
 	bool execed() { return _execed; }
 	bool was_endl() { return id_endl != -1; }
+	int get_write_fd() { return write_fd; }
+	void close_write_fd() { 
+		write_fd_closed = true; 
+		if (0 == (int)s.size()) close(write_fd);
+	}
+	bool closed() { return write_fd_closed; }
+	void set_cfd(int _cfd) { cfd = _cfd; }
+	bool in_epoll() { return !_removed; }
+	void remove_from_epoll() { 
+		if (_removed) return;
+		epoll_remove(efd, cfd, EPOLLIN);
+		_removed = true; 
+	}
 private:
 	std::string s;
-	int cur;
 	char lq;
 	bool _execed;
 	int id_endl;
 	int write_fd;
 	int client_fd;
+	bool write_fd_closed;
+	int cfd;
+	bool _removed;
 };
 
 std::map<int, Buffer> cl_buff;
@@ -158,7 +188,7 @@ std::string read_all(int fd) {
 			break;
 		}	
 		buff[nr] = 0;
-		result += std::string(buff);
+		result += std::string(buff, nr);
 	}
 	if (nr < 0) {
 		if (errno != EAGAIN) {
@@ -179,6 +209,8 @@ void make_nonblocking(int fd) {
 int create_socket(int port) {
 	int sfd;
 	if ((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) error("Error in socket()");
+	int ok = 1;
+	if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &ok, sizeof(ok)) < 0) error("setsockopt");
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(struct sockaddr_in));
 	addr.sin_family = AF_INET;
@@ -213,7 +245,7 @@ void epoll_remove(int efd, int fd, int mask) {
 	ev.events = mask;
 	std::cerr << "epoll_remove: fd = " << fd << std::endl;
 	if (epoll_ctl(efd, EPOLL_CTL_DEL, fd, &ev) < 0) {
-		error("Error in epoll_ctl() (EPOLL_CTL_DEL)");
+		error("Error in epoll_ctl() (EPOLL_CTL_DEL)" + std::string(strerror(errno)));
 	}
 }
 
@@ -228,7 +260,7 @@ void accept_handler(int sfd) {
 	}
 	if (cfd < 0) error("Error in accept():\n" + std::string(strerror(errno)));
 	debug(cfd, "New client to socket");
-	make_nonblocking(cfd);
+	//make_nonblocking(cfd);
 	epoll_add(efd, cfd, EPOLLIN);
 	client_sockets.insert(cfd);
 }
@@ -262,6 +294,15 @@ int exec_command(std::string command, int curstdin, int curstdout, int cfd) {
 void client_handler(int cfd) {
 	std::string s = read_all(cfd);
 	Buffer &buff = cl_buff[cfd];
+	buff.set_cfd(cfd);
+	if (s == "") {
+		std::cerr << "Im here" << std::endl;
+		if (!buff.execed()) error("Was not execed");
+		deb("2");
+		buff.remove_from_epoll();
+		buff.close_write_fd();
+		return;
+	}
 	buff.set_client_fd(cfd);
 	buff.add_data(s);
 	if (buff.execed()) {
@@ -286,6 +327,7 @@ void client_handler(int cfd) {
 				curstdout = cfd;
 			}
 			int chpid = exec_command(commands[i], curstdin, curstdout, cfd);
+			std::cerr << "\"" << commands[i] << "\"" << " is executing in " << chpid << " process" << std::endl;
 			close(curstdin);
 			if (i + 1 < (int)commands.size()) {
 				close(curstdout);
@@ -300,9 +342,14 @@ void chld_handler(int signum, siginfo_t *info, void*) {
 	assert(signum == SIGCHLD);
 	int pid = info->si_pid;
 	waitpid(pid, NULL, 0);
+	std::cerr << pid << " has been closed" << std::endl; 
 	if (wait_child.count(pid) > 0) {
 		int cfd = wait_child[pid];
-		epoll_remove(efd, cfd, EPOLLIN);
+		if (!cl_buff[cfd].closed()) {
+			close(cl_buff[cfd].get_write_fd());
+			deb("4");
+			cl_buff[cfd].remove_from_epoll();
+		}
 		close(cfd);
 		client_sockets.erase(cfd);
 		wait_child.erase(pid);
@@ -341,7 +388,7 @@ void become_daemon() {
 
 int main(int argc, char *argv[]) {
 	if ((argc != 2) || (sscanf(argv[1], "%d\n", &port) < 0)) error("Usage: " + std::string(argv[0]) + " [port]");
-	become_daemon();
+//	become_daemon();
 	make_sigact();
 	sfd = create_socket(port);
 	debug(sfd, "main socket");
@@ -353,10 +400,16 @@ int main(int argc, char *argv[]) {
 	while (true) {
 		int ev_size;
 		if ((ev_size = epoll_wait(efd, evs, MAX_EVENTS, -1)) < 0) {
+			if (errno == EINTR) continue;
 			error("Error in epoll_wait:\n" + std::string(strerror(errno)));
 		}
 		for (int i = 0; i < ev_size; i++) {
 			int fd = evs[i].data.fd;
+			std::cerr << "events = " << evs[i].events << std::endl;
+			if (evs[i].events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR | EPOLLET)) {
+				error("Error in epoll_event");
+				continue;
+			}
 			if (fd == sfd) {
 				accept_handler(sfd);
 			} else if (client_sockets.find(fd) != client_sockets.end()) {
