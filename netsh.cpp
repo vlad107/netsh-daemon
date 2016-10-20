@@ -21,8 +21,8 @@
 #define deb(x) std::cerr << x << std::endl
 #define LISTEN_BACKLOG 10
 #define MAX_EVENTS 100
-#define BUFF_SIZE 1024 * 10
-#define BIG_BUFF_SIZE 1024 * 100 
+#define BUFF_SIZE 1024 * 10000
+#define BIG_BUFF_SIZE 1024 * 10000
 
 void debug(int socket, std::string name) {
 	std::cerr << name << ": " << socket << std::endl;
@@ -75,7 +75,7 @@ struct Buffer {
 
 	std::string get_command() {
 		std::string result = s.substr(0, id_endl);
-		s = s.substr(id_endl);
+		s = s.substr(id_endl + 1);
 		return result;
 	}
 
